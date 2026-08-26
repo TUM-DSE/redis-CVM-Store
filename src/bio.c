@@ -46,6 +46,7 @@
 
 #include "server.h"
 #include "bio.h"
+#include "accelstore.h"
 #include <fcntl.h>
 
 static char* bio_worker_title[] = {
@@ -314,6 +315,24 @@ void *bioProcessBackgroundJobs(void *arg) {
             }
             close(job->fd_args.fd);
         } else if (job_type == BIO_AOF_FSYNC || job_type == BIO_CLOSE_AOF) {
+            /* Under the AccelStore backend the AOF "fd" is a store descriptor:
+             * the fsync is the store's global durability barrier and the close
+             * is the store's close, both blocking-safe on this thread. */
+            if (accelEnabled()) {
+                if (accelFsync() == -1) {
+                    int last_status;
+                    atomicGet(server.aof_bio_fsync_status,last_status);
+                    atomicSet(server.aof_bio_fsync_status,C_ERR);
+                    atomicSet(server.aof_bio_fsync_errno,errno);
+                    if (last_status == C_OK)
+                        serverLog(LL_WARNING, "Fail to fsync the AOF store: %s", strerror(errno));
+                } else {
+                    atomicSet(server.aof_bio_fsync_status,C_OK);
+                    atomicSet(server.fsynced_reploff_pending, job->fd_args.offset);
+                }
+                if (job_type == BIO_CLOSE_AOF)
+                    accelLogClose(job->fd_args.fd);
+            } else {
             /* The fd may be closed by main thread and reused for another
              * socket, pipe, or file. We just ignore these errno because
              * aof fsync did not really fail. */
@@ -340,6 +359,7 @@ void *bioProcessBackgroundJobs(void *arg) {
             }
             if (job_type == BIO_CLOSE_AOF)
                 close(job->fd_args.fd);
+            }
         } else if (job_type == BIO_LAZY_FREE) {
             job->free_args.free_fn(job->free_args.free_args);
         } else if ((job_type == BIO_COMP_RQ_CLOSE_FILE) ||

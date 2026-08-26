@@ -23,6 +23,7 @@
 #include "bio.h"
 #include "cluster_asm.h"
 #include "keymeta.h"
+#include "accelstore.h"
 
 #include <math.h>
 #include <fcntl.h>
@@ -2106,6 +2107,162 @@ werr: /* Write error. */
     return C_ERR;
 }
 
+/* ---------------------------------------------------------------------------
+ * AccelStore RDB snapshots
+ *
+ * With accelstore persistence enabled the RDB snapshot never touches the
+ * filesystem: each snapshot generation is a LOG of streamed segments in the
+ * store, named "<rdb_filename>.<gen>". The commit point that replaces
+ * rename(tmpfile,filename) is a tiny pointer file
+ * "<rdb_filename>.accel-current" in the working directory holding the decimal
+ * generation number; generations start at 1, and 0 (or an absent pointer
+ * file) means no snapshot. Forked children never touch the store: the child
+ * serializes into a pipe and a drainer thread in the parent appends the
+ * segments to the generation's log.
+ * ------------------------------------------------------------------------ */
+
+static long long accel_rdb_gen = -1;      /* Committed generation; -1 = pointer file not read yet. */
+static sds accel_rdb_child_name = NULL;   /* Background save: generation log name. */
+static long long accel_rdb_child_gen = 0; /* Background save: generation being written. */
+static int accel_rdb_child_asfd = -1;     /* Background save: store fd of that log. */
+static int accel_rdb_child_drainer = 0;   /* Background save: drainer thread running. */
+
+static sds accelRdbPtrFilename(const char *filename) {
+    return sdscatfmt(sdsempty(),"%s.accel-current",filename);
+}
+
+static sds accelRdbLogName(const char *filename, long long gen) {
+    return sdscatfmt(sdsempty(),"%s.%I",filename,gen);
+}
+
+/* Return the committed snapshot generation, reading the pointer file once. */
+static long long accelRdbCurrentGen(const char *filename) {
+    if (accel_rdb_gen == -1) {
+        sds ptrfile = accelRdbPtrFilename(filename);
+        FILE *fp = fopen(ptrfile,"r");
+
+        accel_rdb_gen = 0;
+        if (fp) {
+            long long gen;
+            if (fscanf(fp,"%lld",&gen) == 1 && gen > 0) accel_rdb_gen = gen;
+            fclose(fp);
+        }
+        sdsfree(ptrfile);
+    }
+    return accel_rdb_gen;
+}
+
+/* The commit point replacing rename(tmpfile,filename): atomically repoint
+ * "<filename>.accel-current" at 'gen' (tmp file + fsync + rename + directory
+ * fsync), then drop the previous generation's log from the store. Once the
+ * rename went through the commit is taken (accel_rdb_gen is updated) even if
+ * a later step fails and C_ERR is returned, so callers must only delete the
+ * new generation's log when accel_rdb_gen != gen. */
+static int accelRdbCommitGen(const char *filename, long long gen) {
+    char cwd[MAXPATHLEN]; /* Current working dir path for error messages. */
+    long long oldgen = accelRdbCurrentGen(filename);
+    sds ptrfile = accelRdbPtrFilename(filename);
+    sds tmpfile = sdscatfmt(sdsempty(),"%S.tmp",ptrfile);
+    sds content = sdscatfmt(sdsempty(),"%I\n",gen);
+    int retval = C_ERR;
+
+    int fd = open(tmpfile,O_WRONLY|O_CREAT|O_TRUNC,0644);
+    if (fd == -1 ||
+        write(fd,content,sdslen(content)) != (ssize_t)sdslen(content) ||
+        fsync(fd) == -1)
+    {
+        char *str_err = strerror(errno);
+        char *cwdp = getcwd(cwd,MAXPATHLEN);
+        serverLog(LL_WARNING,
+            "Failed writing the accelstore generation pointer file %s "
+            "(in server root dir %s): %s",
+            tmpfile,
+            cwdp ? cwdp : "unknown",
+            str_err);
+        if (fd != -1) close(fd);
+        unlink(tmpfile);
+        goto cleanup;
+    }
+    close(fd);
+
+    if (rename(tmpfile,ptrfile) == -1) {
+        char *str_err = strerror(errno);
+        char *cwdp = getcwd(cwd,MAXPATHLEN);
+        serverLog(LL_WARNING,
+            "Error moving the accelstore generation pointer file %s on the "
+            "final destination %s (in server root dir %s): %s",
+            tmpfile,
+            ptrfile,
+            cwdp ? cwdp : "unknown",
+            str_err);
+        unlink(tmpfile);
+        goto cleanup;
+    }
+    accel_rdb_gen = gen; /* The pointer file moved: this is the commit point. */
+
+    if (fsyncFileDir(ptrfile) != 0) {
+        serverLog(LL_WARNING,
+            "Failed to fsync directory while saving DB: %s", strerror(errno));
+        goto cleanup;
+    }
+
+    /* The pointer moved durably: the previous generation is garbage now. */
+    if (oldgen >= 1) {
+        sds oldname = accelRdbLogName(filename,oldgen);
+        if (accelLogExists(oldname)) accelLogDelete(oldname);
+        sdsfree(oldname);
+    }
+    retval = C_OK;
+
+cleanup:
+    sdsfree(content);
+    sdsfree(tmpfile);
+    sdsfree(ptrfile);
+    return retval;
+}
+
+/* Serialize the dataset into the write end of the drainer pipe, the way
+ * rdbSaveInternal() serializes into its temp file. No autosync: durability
+ * is the final accelFsync() barrier. On error errno and *err_op are set for
+ * the caller's log line. */
+static int accelRdbSaveToPipe(int req, int wfd, rdbSaveInfo *rsi, int rdbflags, char **err_op) {
+    rio rdb;
+    int error = 0;
+    int retval = C_OK;
+
+    rioInitWithFd(&rdb,wfd);
+
+    if (rdbSaveRio(req,&rdb,&error,rdbflags,rsi) == C_ERR) {
+        errno = error;
+        *err_op = "rdbSaveRio";
+        retval = C_ERR;
+    } else if (rioFlush(&rdb) == 0) {
+        *err_op = "rioFlush";
+        retval = C_ERR;
+    }
+
+    rioFreeFd(&rdb);
+    return retval;
+}
+
+/* Reap a background accelstore save whose done handler never ran: the
+ * shutdown path kills the RDB child and calls resetChildState() directly, so
+ * the drainer thread and the partial generation log are still ours to clean
+ * up before a new save may start. The child is dead (or dying) by then, so
+ * joining the drainer only waits for the pipe's EOF. */
+static void accelRdbReapStaleBackgroundSave(void) {
+    if (accel_rdb_child_name == NULL) return;
+    if (accel_rdb_child_drainer) accelJoinDrainer(NULL);
+    accelLogClose(accel_rdb_child_asfd);
+    if (accel_rdb_gen != accel_rdb_child_gen)
+        accelLogDelete(accel_rdb_child_name);
+    sdsfree(accel_rdb_child_name);
+    accel_rdb_child_name = NULL;
+    accel_rdb_child_gen = 0;
+    accel_rdb_child_asfd = -1;
+    accel_rdb_child_drainer = 0;
+}
+
 static int rdbSaveInternal(int req, const char *filename, rdbSaveInfo *rsi, int rdbflags) {
     char cwd[MAXPATHLEN]; /* Current working dir path for error messages. */
     rio rdb;
@@ -2182,6 +2339,75 @@ int rdbSave(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     char cwd[MAXPATHLEN]; /* Current working dir path for error messages. */
 
     startSaving(rdbflags);
+
+    if (accelEnabled()) {
+        long long gen, bytes = 0;
+        sds name;
+        int asfd = -1, created = 0, drainer = 0;
+        int pipefds[2] = {-1,-1};
+        int saved_errno;
+        char *err_op;    /* For a detailed log */
+
+        if (accel_rdb_child_name != NULL) {
+            if (server.child_type == CHILD_TYPE_RDB) {
+                serverLog(LL_WARNING,
+                    "Can't save: a background save is still writing to the accelstore");
+                stopSaving(0);
+                return C_ERR;
+            }
+            accelRdbReapStaleBackgroundSave();
+        }
+
+        gen = accelRdbCurrentGen(filename)+1;
+        name = accelRdbLogName(filename,gen);
+        /* A stale partial log with this name means the previous attempt at
+         * this generation crashed before committing the pointer file. */
+        if (accelLogExists(name)) accelLogDelete(name);
+        if ((asfd = accelLogCreate(name)) < 0) { err_op = "accelLogCreate"; goto aerr; }
+        created = 1;
+        if (pipe(pipefds) == -1) { err_op = "pipe"; goto aerr; }
+        fcntl(pipefds[1],F_SETPIPE_SZ,1<<20); /* Best effort. */
+        if (accelStartDrainer(pipefds[0],asfd) != 0) { err_op = "accelStartDrainer"; goto aerr; }
+        pipefds[0] = -1; /* Now owned by the drainer. */
+        drainer = 1;
+        if (accelRdbSaveToPipe(req,pipefds[1],rsi,rdbflags,&err_op) != C_OK) goto aerr;
+        close(pipefds[1]);
+        pipefds[1] = -1;
+        drainer = 0;
+        if (accelJoinDrainer(&bytes) != 0) { err_op = "accelJoinDrainer"; goto aerr; }
+        if (accelFsync() != 0) { err_op = "accelFsync"; goto aerr; }
+        accelLogClose(asfd);
+        asfd = -1;
+        if (accelRdbCommitGen(filename,gen) != C_OK) {
+            if (accel_rdb_gen != gen) accelLogDelete(name);
+            sdsfree(name);
+            stopSaving(0);
+            return C_ERR;
+        }
+        sdsfree(name);
+
+        serverLog(LL_NOTICE,"DB saved on disk");
+        server.dirty = 0;
+        server.lastsave = time(NULL);
+        server.lastbgsave_status = C_OK;
+        stopSaving(1);
+        return C_OK;
+
+    aerr:
+        saved_errno = errno;
+        serverLog(LL_WARNING,"Write error while saving DB to the accelstore(%s): %s",
+            err_op, strerror(errno));
+        if (pipefds[1] != -1) close(pipefds[1]);
+        if (pipefds[0] != -1) close(pipefds[0]);
+        if (drainer) accelJoinDrainer(NULL);
+        if (asfd != -1) accelLogClose(asfd);
+        if (created) accelLogDelete(name);
+        sdsfree(name);
+        stopSaving(0);
+        errno = saved_errno;
+        return C_ERR;
+    }
+
     snprintf(tmpfile,256,"temp-%d.rdb", (int) getpid());
 
     if (rdbSaveInternal(req,tmpfile,rsi,rdbflags) != C_OK) {
@@ -2222,6 +2448,10 @@ int rdbSave(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
 
 int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     pid_t childpid;
+    long long accel_gen = 0;
+    sds accel_name = NULL;
+    int accel_asfd = -1;
+    int accel_pipe[2] = {-1,-1};
 
     if (hasActiveChildProcess()) return C_ERR;
     server.stat_rdb_saves++;
@@ -2229,13 +2459,52 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     server.dirty_before_bgsave = server.dirty;
     server.lastbgsave_try = time(NULL);
 
+    if (accelEnabled()) {
+        /* The store side is prepared in the parent: the forked child only
+         * ever sees the write end of the pipe. */
+        accelRdbReapStaleBackgroundSave();
+        accel_gen = accelRdbCurrentGen(filename)+1;
+        accel_name = accelRdbLogName(filename,accel_gen);
+        /* A stale partial log with this name means the previous attempt at
+         * this generation crashed before committing the pointer file. */
+        if (accelLogExists(accel_name)) accelLogDelete(accel_name);
+        if ((accel_asfd = accelLogCreate(accel_name)) < 0 ||
+            pipe(accel_pipe) == -1)
+        {
+            serverLog(LL_WARNING,"Can't save in background: accelstore: %s",
+                strerror(errno));
+            if (accel_asfd != -1) {
+                accelLogClose(accel_asfd);
+                accelLogDelete(accel_name);
+            }
+            sdsfree(accel_name);
+            server.lastbgsave_status = C_ERR;
+            return C_ERR;
+        }
+        fcntl(accel_pipe[1],F_SETPIPE_SZ,1<<20); /* Best effort. */
+    }
+
     if ((childpid = redisFork(CHILD_TYPE_RDB)) == 0) {
         int retval;
 
         /* Child */
         redisSetProcTitle("redis-rdb-bgsave");
         redisSetCpuAffinity(server.bgsave_cpulist);
-        retval = rdbSave(req, filename,rsi,rdbflags);
+        if (accelEnabled()) {
+            char *err_op;
+
+            close(accel_pipe[0]);
+            startSaving(rdbflags);
+            retval = accelRdbSaveToPipe(req,accel_pipe[1],rsi,rdbflags,&err_op);
+            if (retval != C_OK)
+                serverLog(LL_WARNING,
+                    "Write error while saving DB to the accelstore(%s): %s",
+                    err_op, strerror(errno));
+            close(accel_pipe[1]);
+            stopSaving(retval == C_OK);
+        } else {
+            retval = rdbSave(req, filename,rsi,rdbflags);
+        }
         if (retval == C_OK) {
             sendChildCowInfo(CHILD_INFO_TYPE_RDB_COW_SIZE, "RDB");
         }
@@ -2243,10 +2512,34 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     } else {
         /* Parent */
         if (childpid == -1) {
+            if (accelEnabled()) {
+                close(accel_pipe[0]);
+                close(accel_pipe[1]);
+                accelLogClose(accel_asfd);
+                accelLogDelete(accel_name);
+                sdsfree(accel_name);
+            }
             server.lastbgsave_status = C_ERR;
             serverLog(LL_WARNING,"Can't save in background: fork: %s",
                 strerror(errno));
             return C_ERR;
+        }
+        if (accelEnabled()) {
+            close(accel_pipe[1]);
+            if (accelStartDrainer(accel_pipe[0],accel_asfd) == 0) {
+                accel_rdb_child_drainer = 1;
+            } else {
+                /* No reader on the pipe: the child's writes will fail with
+                 * EPIPE and the done handler treats the run as failed. */
+                serverLog(LL_WARNING,
+                    "Can't start the accelstore drainer for the background save: %s",
+                    strerror(errno));
+                close(accel_pipe[0]);
+                accel_rdb_child_drainer = 0;
+            }
+            accel_rdb_child_gen = accel_gen;
+            accel_rdb_child_asfd = accel_asfd;
+            accel_rdb_child_name = accel_name;
         }
         serverLog(LL_NOTICE,"Background saving started by pid %ld",(long) childpid);
         server.rdb_save_time_start = time(NULL);
@@ -2263,6 +2556,10 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
 void rdbRemoveTempFile(pid_t childpid, int from_signal) {
     char tmpfile[256];
     char pid[32];
+
+    /* No temp files with accelstore persistence: the snapshot streams
+     * straight into the store. */
+    if (accelEnabled()) return;
 
     /* Generate temp rdb file name using async-signal safe functions. */
     ll2string(pid, sizeof(pid), childpid);
@@ -5144,16 +5441,37 @@ int rdbLoadWithEmptyFunc(char *filename, rdbSaveInfo *rsi, int rdbflags, void (*
     struct stat sb;
     int rdb_fd;
 
-    fp = fopen(filename, "r");
-    if (fp == NULL) {
-        if (errno == ENOENT) return RDB_NOT_EXIST;
+    if (accelEnabled()) {
+        long long gen = accelRdbCurrentGen(filename);
+        long long total = 0;
+        sds name;
 
-        serverLog(LL_WARNING,"Fatal error: can't open the RDB file %s for reading: %s", filename, strerror(errno));
-        return RDB_FAILED;
+        if (gen <= 0) {
+            /* No committed generation: same as an absent RDB file. */
+            errno = ENOENT;
+            return RDB_NOT_EXIST;
+        }
+        name = accelRdbLogName(filename,gen);
+        fp = accelOpenReadStream(name,&total);
+        if (fp == NULL) {
+            serverLog(LL_WARNING,"Fatal error: can't open the RDB log %s for reading: %s", name, strerror(errno));
+            sdsfree(name);
+            return RDB_FAILED;
+        }
+        sdsfree(name);
+        sb.st_size = total;
+    } else {
+        fp = fopen(filename, "r");
+        if (fp == NULL) {
+            if (errno == ENOENT) return RDB_NOT_EXIST;
+
+            serverLog(LL_WARNING,"Fatal error: can't open the RDB file %s for reading: %s", filename, strerror(errno));
+            return RDB_FAILED;
+        }
+
+        if (fstat(fileno(fp), &sb) == -1)
+            sb.st_size = 0;
     }
-
-    if (fstat(fileno(fp), &sb) == -1)
-        sb.st_size = 0;
 
     loadingSetFlags(filename, sb.st_size, 0);
     /* Note that inside loadingSetFlags(), server.loading is set.
@@ -5171,7 +5489,7 @@ int rdbLoadWithEmptyFunc(char *filename, rdbSaveInfo *rsi, int rdbflags, void (*
 
     stopLoading(retval==C_OK);
     /* Reclaim the cache backed by rdb */
-    if (retval == C_OK && !(rdbflags & RDBFLAGS_KEEP_CACHE)) {
+    if (retval == C_OK && !(rdbflags & RDBFLAGS_KEEP_CACHE) && !accelEnabled()) {
         /* TODO: maybe we could combine the fopen and open into one in the future */
         rdb_fd = open(filename, O_RDONLY);
         if (rdb_fd >= 0) bioCreateCloseJob(rdb_fd, 0, 1);
@@ -5182,6 +5500,63 @@ int rdbLoadWithEmptyFunc(char *filename, rdbSaveInfo *rsi, int rdbflags, void (*
 /* A background saving child (BGSAVE) terminated its work. Handle this.
  * This function covers the case of actual BGSAVEs. */
 static void backgroundSaveDoneHandlerDisk(int exitcode, int bysignal, time_t save_end) {
+    if (accelEnabled() && accel_rdb_child_name != NULL) {
+        long long bytes = 0;
+        int ok = (!bysignal && exitcode == 0);
+
+        /* The child exited, so every write end of the pipe is closed and the
+         * drainer sees EOF: joining it cannot block. This runs for a killed
+         * child too, so no path leaves the drainer running. */
+        if (!accel_rdb_child_drainer) {
+            ok = 0;
+        } else if (accelJoinDrainer(&bytes) != 0) {
+            if (ok)
+                serverLog(LL_WARNING,
+                    "Background saving error: accelstore drainer: %s",
+                    strerror(errno));
+            ok = 0;
+        }
+        if (ok && accelFsync() != 0) {
+            serverLog(LL_WARNING,
+                "Background saving error: accelstore fsync: %s",
+                strerror(errno));
+            ok = 0;
+        }
+        accelLogClose(accel_rdb_child_asfd);
+        if (ok && accelRdbCommitGen(server.rdb_filename,accel_rdb_child_gen) != C_OK)
+            ok = 0;
+        if (!ok && accel_rdb_gen != accel_rdb_child_gen)
+            accelLogDelete(accel_rdb_child_name);
+        sdsfree(accel_rdb_child_name);
+        accel_rdb_child_name = NULL;
+        accel_rdb_child_gen = 0;
+        accel_rdb_child_asfd = -1;
+        accel_rdb_child_drainer = 0;
+
+        if (ok) {
+            serverLog(LL_NOTICE,
+                "Background saving terminated with success");
+            server.dirty = server.dirty - server.dirty_before_bgsave;
+            server.lastsave = save_end;
+            server.lastbgsave_status = C_OK;
+            server.stat_rdb_consecutive_failures = 0;
+        } else if (!bysignal) {
+            serverLog(LL_WARNING, "Background saving error");
+            server.lastbgsave_status = C_ERR;
+            server.stat_rdb_consecutive_failures++;
+        } else {
+            serverLog(LL_WARNING,
+                "Background saving terminated by signal %d", bysignal);
+            /* SIGUSR1 is whitelisted, so we have a way to kill a child without
+             * triggering an error condition. */
+            if (bysignal != SIGUSR1) {
+                server.lastbgsave_status = C_ERR;
+                server.stat_rdb_consecutive_failures++;
+            }
+        }
+        return;
+    }
+
     if (!bysignal && exitcode == 0) {
         serverLog(LL_NOTICE,
             "Background saving terminated with success");
