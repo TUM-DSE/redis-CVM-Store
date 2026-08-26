@@ -18,6 +18,7 @@
 #include "cluster_slot_stats.h"
 #include "slowlog.h"
 #include "bio.h"
+#include "accelstore.h"
 #include "latency.h"
 #include "atomicvar.h"
 #include "mt19937-64.h"
@@ -5205,7 +5206,10 @@ int finishShutdown(void) {
         /* Append only file: flush buffers and fsync() the AOF at exit */
         serverLog(LL_NOTICE,"Calling fsync() on the AOF file.");
         flushAppendOnlyFile(1);
-        if (redis_fsync(server.aof_fd) == -1) {
+        if (accelEnabled()) {
+            if (accelFsync() == -1)
+                serverLog(LL_WARNING,"Fail to fsync the AOF store: %s.", strerror(errno));
+        } else if (redis_fsync(server.aof_fd) == -1) {
             serverLog(LL_WARNING,"Fail to fsync the AOF file: %s.",
                                  strerror(errno));
         }
@@ -5266,6 +5270,13 @@ int finishShutdown(void) {
     }
 #endif /* __sun */
 
+
+    /* Stop the AccelStore store last: drain the bio AOF worker first so no
+     * store operation is outstanding when the store shuts down. */
+    if (accelEnabled()) {
+        bioDrainWorker(BIO_AOF_FSYNC);
+        accelShutdown();
+    }
 
     serverLog(LL_WARNING,"%s is now ready to exit, bye bye...",
         server.sentinel_mode ? "Sentinel" : "Redis");
@@ -8396,6 +8407,18 @@ int main(int argc, char **argv) {
     if (!server.sentinel_mode) {
         /* Things not needed when running in Sentinel mode. */
         serverLog(LL_NOTICE,"Server initialized");
+        if (server.accel_config && server.accel_config[0] != '\0') {
+#ifdef USE_ACCELSTORE
+            if (accelInit() != C_OK) {
+                serverLog(LL_WARNING, "Fatal: AccelStore store failed to start.");
+                exit(1);
+            }
+#else
+            serverLog(LL_WARNING, "Fatal: accelstore-config set but this binary "
+                                  "was built without ACCELSTORE=yes.");
+            exit(1);
+#endif
+        }
         aofLoadManifestFromDisk();
         loadDataFromDisk();
         /* Make the on-disk AOF match the preloaded in-memory dataset so

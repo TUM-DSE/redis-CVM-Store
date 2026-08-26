@@ -2333,6 +2333,16 @@ struct redisServer {
     int cluster_compatibility_sample_ratio; /* Sampling ratio for cluster mode incompatible commands. */
     int lazyexpire_nested_arbitrary_keys; /* If disabled, avoid lazy-expire from commands that touch arbitrary keys (SCAN/RANDOMKEY) within transactions */
 
+    /* AccelStore persistence backend (accelstore.c); on when accel_config is set. */
+    char *accel_config;             /* SPDK JSON config path; "" = disabled */
+    char *accel_device;             /* bdev name inside that config */
+    int accel_workers;              /* store worker threads (ops in flight) */
+    int accel_cores;                /* reactor cores; 0 = workers + 1 */
+    char *accel_core_mask;          /* reactor core mask (hex); "" = use accel_cores */
+    int accel_tc_rtt_us;            /* >0: mock-remote trusted counter RTT */
+    unsigned long long accel_cluster_size; /* blobstore cluster size at creation */
+    int accel_md_pages;             /* blobstore md pages at creation */
+
     /* AOF persistence */
     int aof_enabled;                /* AOF configuration */
     int aof_state;                  /* AOF_(ON|OFF|WAIT_REWRITE) */

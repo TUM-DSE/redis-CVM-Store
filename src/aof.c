@@ -12,6 +12,7 @@
 #include "rio.h"
 #include "functions.h"
 #include "cluster_asm.h"
+#include "accelstore.h"
 
 #include <signal.h>
 #include <fcntl.h>
@@ -39,6 +40,26 @@ void aof_background_fsync_and_close(int fd);
  * the temp INCR AOF. This variable is used to record the start offset, and
  * set the start offset of the real INCR AOF when the AOFRW is done. */
 static long long tempIncAofStartReplOffset = 0;
+
+/* In-flight AOFRW state under the AccelStore backend. */
+static sds accel_rewrite_base_name = NULL;
+static int accel_rewrite_base_asfd = -1;
+static int accel_rewrite_drainer_active = 0;
+
+static int rewriteAppendOnlyFileToAccelLog(const char *base_name);
+
+/* Drop the in-flight rewrite BASE log state, deleting the log if asked. */
+static void aofAccelClearRewriteBase(int delete_log) {
+    if (accel_rewrite_base_asfd != -1) {
+        accelLogClose(accel_rewrite_base_asfd);
+        accel_rewrite_base_asfd = -1;
+    }
+    if (accel_rewrite_base_name) {
+        if (delete_log) accelLogDelete(accel_rewrite_base_name);
+        sdsfree(accel_rewrite_base_name);
+        accel_rewrite_base_name = NULL;
+    }
+}
 
 /* ----------------------------------------------------------------------------
  * AOF Manifest file implementation.
@@ -639,6 +660,11 @@ int persistAofManifest(aofManifest *am) {
  * problems, and redis will retry the upgrade process when it restarts.
  */
 void aofUpgradePrepare(aofManifest *am) {
+    if (accelEnabled()) {
+        serverLog(LL_WARNING, "Upgrading an old-style AOF file (%s) is not "
+            "supported with the accelstore backend", server.aof_filename);
+        exit(1);
+    }
     serverAssert(!aofFileExist(server.aof_filename));
 
     /* Create AOF directory use 'server.aof_dirname' as the name. */
@@ -701,10 +727,16 @@ int aofDelHistoryFiles(void) {
     while ((ln = listNext(&li)) != NULL) {
         aofInfo *ai = (aofInfo*)ln->value;
         serverAssert(ai->file_type == AOF_FILE_TYPE_HIST);
-        serverLog(LL_NOTICE, "Removing the history file %s in the background", ai->file_name);
-        sds aof_filepath = makePath(server.aof_dirname, ai->file_name);
-        bg_unlink(aof_filepath);
-        sdsfree(aof_filepath);
+        if (accelEnabled()) {
+            /* Store log deletion is cheap metadata, do it inline. */
+            serverLog(LL_NOTICE, "Removing the history log %s", ai->file_name);
+            accelLogDelete(ai->file_name);
+        } else {
+            serverLog(LL_NOTICE, "Removing the history file %s in the background", ai->file_name);
+            sds aof_filepath = makePath(server.aof_dirname, ai->file_name);
+            bg_unlink(aof_filepath);
+            sdsfree(aof_filepath);
+        }
         listDelNode(server.aof_manifest->history_aof_list, ln);
     }
 
@@ -749,11 +781,17 @@ void aofOpenIfNeededOnServerStart(void) {
     size_t incr_aof_len = listLength(server.aof_manifest->incr_aof_list);
     if (!server.aof_manifest->base_aof_info && !incr_aof_len) {
         sds base_name = getNewBaseFileNameAndMarkPreAsHistory(server.aof_manifest);
-        sds base_filepath = makePath(server.aof_dirname, base_name);
-        if (rewriteAppendOnlyFile(base_filepath) != C_OK) {
-            exit(1);
+        if (accelEnabled()) {
+            if (rewriteAppendOnlyFileToAccelLog(base_name) != C_OK) {
+                exit(1);
+            }
+        } else {
+            sds base_filepath = makePath(server.aof_dirname, base_name);
+            if (rewriteAppendOnlyFile(base_filepath) != C_OK) {
+                exit(1);
+            }
+            sdsfree(base_filepath);
         }
-        sdsfree(base_filepath);
         serverLog(LL_NOTICE, "Creating AOF base file %s on server start",
             base_name);
     }
@@ -763,9 +801,15 @@ void aofOpenIfNeededOnServerStart(void) {
     sds aof_name = getLastIncrAofName(server.aof_manifest);
 
     /* Here we should use 'O_APPEND' flag. */
-    sds aof_filepath = makePath(server.aof_dirname, aof_name);
-    server.aof_fd = open(aof_filepath, O_WRONLY|O_APPEND|O_CREAT, 0644);
-    sdsfree(aof_filepath);
+    if (accelEnabled()) {
+        /* O_CREAT: the manifest may name an INCR log that does not exist yet. */
+        server.aof_fd = accelLogExists(aof_name) ? accelLogOpenAppend(aof_name)
+                                                 : accelLogCreate(aof_name);
+    } else {
+        sds aof_filepath = makePath(server.aof_dirname, aof_name);
+        server.aof_fd = open(aof_filepath, O_WRONLY|O_APPEND|O_CREAT, 0644);
+        sdsfree(aof_filepath);
+    }
     if (server.aof_fd == -1) {
         serverLog(LL_WARNING, "Can't open the append-only file %s: %s",
             aof_name, strerror(errno));
@@ -980,6 +1024,12 @@ void aofSetupAfterPreloadFile(void) {
         return;
     }
 
+    if (accelEnabled()) {
+        serverLog(LL_WARNING, "Installing a preload-file into the AOF is not "
+            "supported with the accelstore backend");
+        exit(1);
+    }
+
     if (dirCreateIfMissing(server.aof_dirname) == -1) {
         serverLog(LL_WARNING, "Can't open or create append-only dir %s: %s",
                               server.aof_dirname, strerror(errno));
@@ -1032,6 +1082,7 @@ void aofSetupAfterPreloadFile(void) {
 }
 
 int aofFileExist(char *filename) {
+    if (accelEnabled()) return accelLogExists(filename);
     sds file_path = makePath(server.aof_dirname, filename);
     int ret = fileExist(file_path);
     sdsfree(file_path);
@@ -1070,9 +1121,15 @@ int openNewIncrAofForAppend(void) {
         temp_am = aofManifestDup(server.aof_manifest);
         new_aof_name = sdsdup(getNewIncrAofName(temp_am, server.master_repl_offset));
     }
-    sds new_aof_filepath = makePath(server.aof_dirname, new_aof_name);
-    newfd = open(new_aof_filepath, O_WRONLY|O_TRUNC|O_CREAT, 0644);
-    sdsfree(new_aof_filepath);
+    if (accelEnabled()) {
+        /* O_TRUNC: a stale log may be left over from a crashed run. */
+        if (accelLogExists(new_aof_name)) accelLogDelete(new_aof_name);
+        newfd = accelLogCreate(new_aof_name);
+    } else {
+        sds new_aof_filepath = makePath(server.aof_dirname, new_aof_name);
+        newfd = open(new_aof_filepath, O_WRONLY|O_TRUNC|O_CREAT, 0644);
+        sdsfree(new_aof_filepath);
+    }
     if (newfd == -1) {
         serverLog(LL_WARNING, "Can't open the append-only file %s: %s",
             new_aof_name, strerror(errno));
@@ -1112,7 +1169,12 @@ int openNewIncrAofForAppend(void) {
 
 cleanup:
     if (new_aof_name) sdsfree(new_aof_name);
-    if (newfd != -1) close(newfd);
+    if (newfd != -1) {
+        if (accelEnabled())
+            accelLogClose(newfd);
+        else
+            close(newfd);
+    }
     if (temp_am) aofManifestFree(temp_am);
     return C_ERR;
 }
@@ -1260,12 +1322,15 @@ void killAppendOnlyChild(void) {
 void stopAppendOnly(void) {
     serverAssert(server.aof_state != AOF_OFF);
     flushAppendOnlyFile(1);
-    if (redis_fsync(server.aof_fd) == -1) {
+    if ((accelEnabled() ? accelFsync() : redis_fsync(server.aof_fd)) == -1) {
         serverLog(LL_WARNING,"Fail to fsync the AOF file: %s",strerror(errno));
     } else {
         server.aof_last_fsync = server.mstime;
     }
-    close(server.aof_fd);
+    if (accelEnabled())
+        accelLogClose(server.aof_fd);
+    else
+        close(server.aof_fd);
     updateCurIncrAofEndOffset();
 
     server.aof_fd = -1;
@@ -1287,6 +1352,13 @@ void stopAppendOnly(void) {
  * at runtime using the CONFIG command. */
 int startAppendOnly(void) {
     serverAssert(server.aof_state == AOF_OFF);
+
+    if (accelEnabled()) {
+        /* The AOF_WAIT_REWRITE temp-INCR rename dance has no store equivalent. */
+        serverLog(LL_WARNING, "Enabling appendonly at runtime is not supported "
+            "with the accelstore backend, start the server with appendonly yes");
+        return C_ERR;
+    }
 
     server.aof_state = AOF_WAIT_REWRITE;
     if (hasActiveChildProcess() && server.child_type != CHILD_TYPE_AOF) {
@@ -1360,6 +1432,9 @@ void applyAppendOnlyConfig(void) {
  * there is an actual error condition we'll get it at the next try. */
 ssize_t aofWrite(int fd, const char *buf, size_t len) {
     ssize_t nwritten = 0, totwritten = 0;
+
+    /* accelLogAppend splits large writes and mirrors write(2)'s short-write contract. */
+    if (accelEnabled()) return accelLogAppend(fd, buf, len);
 
     while(len) {
         nwritten = write(fd, buf, len);
@@ -1512,7 +1587,9 @@ void flushAppendOnlyFile(int force) {
                                        (long long)sdslen(server.aof_buf));
             }
 
-            if (ftruncate(server.aof_fd, server.aof_last_incr_size) == -1) {
+            if (accelEnabled()) {
+                /* Store entries are all-or-nothing: nothing to truncate, retry the tail later. */
+            } else if (ftruncate(server.aof_fd, server.aof_last_incr_size) == -1) {
                 if (can_log) {
                     serverLog(LL_WARNING, "Could not remove short write "
                              "from the append-only file.  Redis may refuse "
@@ -1586,7 +1663,7 @@ try_fsync:
         /* Let's try to get this data on the disk. To guarantee data safe when
          * the AOF fsync policy is 'always', we should exit if failed to fsync
          * AOF (see comment next to the exit(1) after write error above). */
-        if (redis_fsync(server.aof_fd) == -1) {
+        if ((accelEnabled() ? accelFsync() : redis_fsync(server.aof_fd)) == -1) {
             serverLog(LL_WARNING,"Can't persist AOF for fsync error when the "
               "AOF fsync policy is 'always': %s. Exiting...", strerror(errno));
             exit(1);
@@ -1728,6 +1805,11 @@ struct client *createAOFClient(void) {
 }
 
 int loadPreLoadAOFFile(char *file) {
+    if (accelEnabled()) {
+        serverLog(LL_WARNING, "preload-file (%s) is not supported with the "
+            "accelstore backend", file);
+        return AOF_FAILED;
+    }
     aofManifest* preload_am = aofManifestCreate();
     aofInfo *ai = aofInfoCreate();
     ai->file_name = sdsnew(file);
@@ -1750,6 +1832,11 @@ int loadPreLoadAOFFile(char *file) {
 }
 
 int loadPreLoadManifestFile(char *file) {
+    if (accelEnabled()) {
+        serverLog(LL_WARNING, "preload-file (%s) is not supported with the "
+            "accelstore backend", file);
+        return AOF_FAILED;
+    }
     aofManifest* preload_am = aofLoadManifestFromFile(file);
 
     /* We change server.aof_filename temporarily to skip upgradeAofIfNeeded */
@@ -1818,24 +1905,49 @@ int loadSingleAppendOnlyFile(char *filename) {
     int ret = AOF_OK;
 
     sds aof_filepath = makePath(server.aof_dirname, filename);
-    FILE *fp = fopen(aof_filepath, "r");
-    if (fp == NULL) {
-        int en = errno;
-        if (redis_stat(aof_filepath, &sb) == 0 || errno != ENOENT) {
-            serverLog(LL_WARNING,"Fatal error: can't open the append log file %s for reading: %s", filename, strerror(en));
-            sdsfree(aof_filepath);
-            return AOF_OPEN_ERR;
-        } else {
-            serverLog(LL_WARNING,"The append log file %s doesn't exist: %s", filename, strerror(errno));
-            sdsfree(aof_filepath);
-            return AOF_NOT_EXIST;
+    FILE *fp;
+    if (accelEnabled()) {
+        /* Stream the store LOG named by the file's basename. */
+        long long total_bytes = 0;
+        memset(&sb, 0, sizeof(sb));
+        fp = accelOpenReadStream(filename, &total_bytes);
+        if (fp == NULL) {
+            int en = errno;
+            if (accelLogExists(filename)) {
+                serverLog(LL_WARNING,"Fatal error: can't open the append log %s for reading from the store: %s", filename, strerror(en));
+                sdsfree(aof_filepath);
+                return AOF_OPEN_ERR;
+            } else {
+                serverLog(LL_WARNING,"The append log %s doesn't exist in the store: %s", filename, strerror(en));
+                sdsfree(aof_filepath);
+                return AOF_NOT_EXIST;
+            }
         }
-    }
+        if (total_bytes == 0) {
+            fclose(fp);
+            sdsfree(aof_filepath);
+            return AOF_EMPTY;
+        }
+    } else {
+        fp = fopen(aof_filepath, "r");
+        if (fp == NULL) {
+            int en = errno;
+            if (redis_stat(aof_filepath, &sb) == 0 || errno != ENOENT) {
+                serverLog(LL_WARNING,"Fatal error: can't open the append log file %s for reading: %s", filename, strerror(en));
+                sdsfree(aof_filepath);
+                return AOF_OPEN_ERR;
+            } else {
+                serverLog(LL_WARNING,"The append log file %s doesn't exist: %s", filename, strerror(errno));
+                sdsfree(aof_filepath);
+                return AOF_NOT_EXIST;
+            }
+        }
 
-    if (fp && redis_fstat(fileno(fp),&sb) != -1 && sb.st_size == 0) {
-        fclose(fp);
-        sdsfree(aof_filepath);
-        return AOF_EMPTY;
+        if (fp && redis_fstat(fileno(fp),&sb) != -1 && sb.st_size == 0) {
+            fclose(fp);
+            sdsfree(aof_filepath);
+            return AOF_EMPTY;
+        }
     }
 
     /* Temporarily disable AOF, to prevent EXEC from feeding a MULTI
@@ -2039,6 +2151,14 @@ readerr: /* Read error. If feof(fp) is true, fall through to unexpected EOF. */
     }
 
 uxeof: /* Unexpected AOF end of file. */
+    if (accelEnabled()) {
+        /* Store entries are atomic, so a torn tail means real damage: never truncate. */
+        serverLog(LL_WARNING, "Unexpected end of the append only log %s in the "
+            "accelstore backend (log entries are atomic, a torn tail should be "
+            "impossible), not truncating", filename);
+        ret = AOF_FAILED;
+        goto cleanup;
+    }
     if (server.aof_load_truncated) {
         serverLog(LL_WARNING,"!!! Warning: short read while loading the AOF file %s!!!", filename);
         serverLog(LL_WARNING,"!!! Truncating the AOF %s at offset %llu !!!",
@@ -2056,6 +2176,14 @@ uxeof: /* Unexpected AOF end of file. */
     goto cleanup;
 
 fmterr: /* Format error. */
+    if (accelEnabled()) {
+        serverLog(LL_WARNING, "Bad file format reading the append only log %s "
+            "at offset %llu in the accelstore backend (log entries are atomic, "
+            "a corrupt tail should be impossible), not truncating",
+            filename, (unsigned long long)valid_up_to);
+        ret = AOF_FAILED;
+        goto cleanup;
+    }
     /* fmterr may be caused by accidentally machine shutdown, so if the broken tail
      * is less than a specified size, try to recover it automatically */
     if (server.aof_load_corrupt_tail_max_size && sb.st_size - valid_up_to < server.aof_load_corrupt_tail_max_size) {
@@ -2080,10 +2208,15 @@ cleanup:
     if (fakeClient) freeClient(fakeClient);
     server.current_client = old_cur_client;
     server.executing_client = old_exec_client;
-    int fd = dup(fileno(fp));
-    fclose(fp);
-    /* Reclaim page cache memory used by the AOF file in background. */
-    if (fd >= 0) bioCreateCloseJob(fd, 0, 1);
+    if (accelEnabled()) {
+        /* No fd and no page cache behind the fopencookie stream. */
+        fclose(fp);
+    } else {
+        int fd = dup(fileno(fp));
+        fclose(fp);
+        /* Reclaim page cache memory used by the AOF file in background. */
+        if (fd >= 0) bioCreateCloseJob(fd, 0, 1);
+    }
     sdsfree(aof_filepath);
     return ret;
 }
@@ -3107,6 +3240,19 @@ werr:
     return C_ERR;
 }
 
+/* Serialize the dataset in BASE file format: RDB preamble or command stream. */
+static int rewriteAppendOnlyFileRioGeneric(rio *aof) {
+    if (server.aof_use_rdb_preamble) {
+        int error;
+        if (rdbSaveRio(SLAVE_REQ_NONE,aof,&error,RDBFLAGS_AOF_PREAMBLE,NULL) == C_ERR) {
+            errno = error;
+            return C_ERR;
+        }
+        return C_OK;
+    }
+    return rewriteAppendOnlyFileRio(aof);
+}
+
 /* Write a sequence of commands able to fully rebuild the dataset into
  * "filename". Used both by REWRITEAOF and BGREWRITEAOF.
  *
@@ -3137,15 +3283,7 @@ int rewriteAppendOnlyFile(char *filename) {
 
     startSaving(RDBFLAGS_AOF_PREAMBLE);
 
-    if (server.aof_use_rdb_preamble) {
-        int error;
-        if (rdbSaveRio(SLAVE_REQ_NONE,&aof,&error,RDBFLAGS_AOF_PREAMBLE,NULL) == C_ERR) {
-            errno = error;
-            goto werr;
-        }
-    } else {
-        if (rewriteAppendOnlyFileRio(&aof) == C_ERR) goto werr;
-    }
+    if (rewriteAppendOnlyFileRioGeneric(&aof) == C_ERR) goto werr;
 
     /* Make sure data will not remain on the OS's output buffers */
     if (fflush(fp)) goto werr;
@@ -3176,6 +3314,56 @@ werr:
     stopSaving(0);
     return C_ERR;
 }
+
+/* rewriteAppendOnlyFile() into the store LOG 'base_name' through the drainer pipe. */
+static int rewriteAppendOnlyFileToAccelLog(const char *base_name) {
+    rio aof;
+    int pipefd[2];
+    int ret = C_OK;
+
+    if (accelLogExists(base_name)) accelLogDelete(base_name);
+    int asfd = accelLogCreate(base_name);
+    if (asfd == -1) {
+        serverLog(LL_WARNING, "Can't create the AOF base log %s in the store: %s",
+            base_name, strerror(errno));
+        return C_ERR;
+    }
+    if (pipe(pipefd) == -1) {
+        serverLog(LL_WARNING, "Can't create the AOF rewrite pipe: %s", strerror(errno));
+        accelLogClose(asfd);
+        accelLogDelete(base_name);
+        return C_ERR;
+    }
+    fcntl(pipefd[0], F_SETPIPE_SZ, 1<<20); /* Best effort. */
+    if (accelStartDrainer(pipefd[0], asfd) == -1) {
+        serverLog(LL_WARNING, "Can't start the AOF store drainer thread");
+        close(pipefd[0]);
+        close(pipefd[1]);
+        accelLogClose(asfd);
+        accelLogDelete(base_name);
+        return C_ERR;
+    }
+
+    startSaving(RDBFLAGS_AOF_PREAMBLE);
+    rioInitWithFd(&aof, pipefd[1]);
+    if (rewriteAppendOnlyFileRioGeneric(&aof) == C_ERR || rioFlush(&aof) == 0)
+        ret = C_ERR;
+    rioFreeFd(&aof);
+    close(pipefd[1]); /* The drainer sees EOF and flushes its tail. */
+    if (accelJoinDrainer(NULL) == -1) ret = C_ERR;
+    if (ret == C_OK && accelFsync() == -1) ret = C_ERR;
+    accelLogClose(asfd);
+
+    if (ret != C_OK) {
+        serverLog(LL_WARNING,"Write error writing append only base log %s to the store: %s",
+            base_name, strerror(errno));
+        accelLogDelete(base_name);
+        stopSaving(0);
+        return C_ERR;
+    }
+    stopSaving(1);
+    return C_OK;
+}
 /* ----------------------------------------------------------------------------
  * AOF background rewrite
  * ------------------------------------------------------------------------- */
@@ -3196,6 +3384,7 @@ werr:
  */
 int rewriteAppendOnlyFileBackground(void) {
     pid_t childpid;
+    int accel_pipe[2] = {-1, -1};
 
     if (hasActiveChildProcess()) return C_ERR;
     if (server.backup_state == BACKUP_STATE_SNAPSHOTTING ||
@@ -3236,12 +3425,64 @@ int rewriteAppendOnlyFileBackground(void) {
 
     server.stat_aof_rewrites++;
 
+    if (accelEnabled()) {
+        /* Create the BASE log under its final name here; the child only writes the pipe. */
+        serverAssert(accel_rewrite_base_name == NULL &&
+                     accel_rewrite_base_asfd == -1 &&
+                     !accel_rewrite_drainer_active);
+        char *format_suffix = server.aof_use_rdb_preamble ?
+            RDB_FORMAT_SUFFIX:AOF_FORMAT_SUFFIX;
+        accel_rewrite_base_name = sdscatprintf(sdsempty(), "%s.%lld%s%s",
+            server.aof_filename, server.aof_manifest->curr_base_file_seq + 1,
+            BASE_FILE_SUFFIX, format_suffix);
+        if (accelLogExists(accel_rewrite_base_name))
+            accelLogDelete(accel_rewrite_base_name);
+        accel_rewrite_base_asfd = accelLogCreate(accel_rewrite_base_name);
+        if (accel_rewrite_base_asfd == -1) {
+            serverLog(LL_WARNING,
+                "Can't create the AOF base log %s in the store: %s",
+                accel_rewrite_base_name, strerror(errno));
+            aofAccelClearRewriteBase(0);
+            server.aof_lastbgrewrite_status = C_ERR;
+            return C_ERR;
+        }
+        if (pipe(accel_pipe) == -1) {
+            serverLog(LL_WARNING,
+                "Can't create the AOF rewrite pipe: %s", strerror(errno));
+            aofAccelClearRewriteBase(1);
+            server.aof_lastbgrewrite_status = C_ERR;
+            return C_ERR;
+        }
+        fcntl(accel_pipe[0], F_SETPIPE_SZ, 1<<20); /* Best effort. */
+    }
+
     if ((childpid = redisFork(CHILD_TYPE_AOF)) == 0) {
         char tmpfile[256];
 
         /* Child */
         redisSetProcTitle("redis-aof-rewrite");
         redisSetCpuAffinity(server.aof_rewrite_cpulist);
+        if (accelEnabled()) {
+            rio aof;
+
+            close(accel_pipe[0]);
+            rioInitWithFd(&aof, accel_pipe[1]);
+            startSaving(RDBFLAGS_AOF_PREAMBLE);
+            if (rewriteAppendOnlyFileRioGeneric(&aof) == C_OK && rioFlush(&aof)) {
+                stopSaving(1);
+                rioFreeFd(&aof);
+                close(accel_pipe[1]);
+                serverLog(LL_NOTICE,
+                    "Successfully streamed the AOF base to the parent's store drainer");
+                sendChildCowInfo(CHILD_INFO_TYPE_AOF_COW_SIZE, "AOF rewrite");
+                exitFromChild(0, 0);
+            } else {
+                stopSaving(0);
+                rioFreeFd(&aof);
+                close(accel_pipe[1]);
+                exitFromChild(1, 0);
+            }
+        }
         snprintf(tmpfile,256,"temp-rewriteaof-bg-%d.aof", (int) getpid());
         if (rewriteAppendOnlyFile(tmpfile) == C_OK) {
             serverLog(LL_NOTICE,
@@ -3254,11 +3495,28 @@ int rewriteAppendOnlyFileBackground(void) {
     } else {
         /* Parent */
         if (childpid == -1) {
+            if (accelEnabled()) {
+                close(accel_pipe[0]);
+                close(accel_pipe[1]);
+                aofAccelClearRewriteBase(1);
+            }
             server.aof_lastbgrewrite_status = C_ERR;
             serverLog(LL_WARNING,
                 "Can't rewrite append only file in background: fork: %s",
                 strerror(errno));
             return C_ERR;
+        }
+        if (accelEnabled()) {
+            close(accel_pipe[1]);
+            if (accelStartDrainer(accel_pipe[0], accel_rewrite_base_asfd) == -1) {
+                serverLog(LL_WARNING, "Can't start the AOF store drainer thread");
+                close(accel_pipe[0]);
+                /* killAppendOnlyChild() reclaims the partial base log via aofRemoveTempFile(). */
+                killAppendOnlyChild();
+                server.aof_lastbgrewrite_status = C_ERR;
+                return C_ERR;
+            }
+            accel_rewrite_drainer_active = 1;
         }
         serverLog(LL_NOTICE,
             "Background append only file rewriting started by pid %ld",(long) childpid);
@@ -3293,6 +3551,16 @@ void bgrewriteaofCommand(client *c) {
 void aofRemoveTempFile(pid_t childpid) {
     char tmpfile[256];
 
+    if (accelEnabled()) {
+        /* No temp files: reclaim the partial BASE log of an aborted rewrite. */
+        if (accel_rewrite_drainer_active) {
+            accel_rewrite_drainer_active = 0;
+            accelJoinDrainer(NULL);
+        }
+        aofAccelClearRewriteBase(1);
+        return;
+    }
+
     snprintf(tmpfile,256,"temp-rewriteaof-bg-%d.aof", (int) childpid);
     bg_unlink(tmpfile);
 
@@ -3307,6 +3575,23 @@ off_t getAppendOnlyFileSize(sds filename, int *status) {
     struct redis_stat sb;
     off_t size;
     mstime_t latency;
+
+    if (accelEnabled()) {
+        latencyStartMonitor(latency);
+        long long total = accelLogTotalBytes(filename);
+        if (total == -1) {
+            if (status) *status = errno == ENOENT ? AOF_NOT_EXIST : AOF_OPEN_ERR;
+            serverLog(LL_WARNING, "Unable to obtain the AOF log %s length from "
+                "the store: %s", filename, strerror(errno));
+            size = 0;
+        } else {
+            if (status) *status = AOF_OK;
+            size = (off_t)total;
+        }
+        latencyEndMonitor(latency);
+        latencyAddSampleIfNeeded("aof-fstat", latency);
+        return size;
+    }
 
     sds aof_filepath = makePath(server.aof_dirname, filename);
     latencyStartMonitor(latency);
@@ -3634,6 +3919,12 @@ void backupCron(void) {
 
 /* BACKUP START: begin a new backup window. */
 static void backupStartCommand(client *c) {
+    if (accelEnabled()) {
+        /* BACKUP pins files with hard links, which the store cannot do. */
+        serverLog(LL_WARNING, "BACKUP is not supported with the accelstore backend");
+        addReplyError(c, "BACKUP is not supported with the accelstore backend");
+        return;
+    }
     if (backupIsInProgress()) {
         addReplyError(c, "A backup is already in progress, ABORT it first");
         return;
@@ -3847,6 +4138,19 @@ NULL
 void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
     int rewrite_success = 0;
     char bgrewrite_error[256] = "";
+    int accel_drained_ok = 0;
+
+    /* The child exited, so the drainer is at EOF: join it before judging the rewrite. */
+    if (accelEnabled() && accel_rewrite_drainer_active) {
+        accel_rewrite_drainer_active = 0;
+        if (accelJoinDrainer(NULL) == -1) {
+            serverLog(LL_WARNING,
+                "Draining the rewritten AOF base into the store failed: %s",
+                strerror(errno));
+        } else {
+            accel_drained_ok = 1;
+        }
+    }
 
     if (!bysignal && exitcode == 0) {
         char tmpfile[256];
@@ -3858,6 +4162,22 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
 
         serverLog(LL_NOTICE,
             "Background AOF rewrite terminated with success");
+
+        if (accelEnabled()) {
+            /* The new BASE log must be durable before the manifest names it. */
+            serverAssert(accel_rewrite_base_name != NULL);
+            if (!accel_drained_ok || accelFsync() == -1) {
+                serverLog(LL_WARNING,
+                    "Can't persist the rewritten AOF base log %s in the store",
+                    accel_rewrite_base_name);
+                aofAccelClearRewriteBase(1);
+                server.aof_lastbgrewrite_status = C_ERR;
+                server.stat_aofrw_consecutive_failures++;
+                goto cleanup;
+            }
+            accelLogClose(accel_rewrite_base_asfd);
+            accel_rewrite_base_asfd = -1;
+        }
 
         snprintf(tmpfile, 256, "temp-rewriteaof-bg-%d.aof",
             (int)server.child_pid);
@@ -3874,23 +4194,28 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
         new_base_filepath = makePath(server.aof_dirname, new_base_filename);
 
         /* Rename the temporary aof file to 'new_base_filename'. */
-        latencyStartMonitor(latency);
-        if (rename(tmpfile, new_base_filepath) == -1) {
-            serverLog(LL_WARNING,
-                "Error trying to rename the temporary AOF base file %s into %s: %s",
-                tmpfile,
-                new_base_filepath,
-                strerror(errno));
-            aofManifestFree(temp_am);
-            sdsfree(new_base_filepath);
-            server.aof_lastbgrewrite_status = C_ERR;
-            server.stat_aofrw_consecutive_failures++;
-            goto cleanup;
+        if (accelEnabled()) {
+            /* The BASE log already carries its final name, nothing to rename. */
+            serverAssert(!strcmp(new_base_filename, accel_rewrite_base_name));
+        } else {
+            latencyStartMonitor(latency);
+            if (rename(tmpfile, new_base_filepath) == -1) {
+                serverLog(LL_WARNING,
+                    "Error trying to rename the temporary AOF base file %s into %s: %s",
+                    tmpfile,
+                    new_base_filepath,
+                    strerror(errno));
+                aofManifestFree(temp_am);
+                sdsfree(new_base_filepath);
+                server.aof_lastbgrewrite_status = C_ERR;
+                server.stat_aofrw_consecutive_failures++;
+                goto cleanup;
+            }
+            latencyEndMonitor(latency);
+            latencyAddSampleIfNeeded("aof-rename", latency);
+            serverLog(LL_NOTICE,
+                "Successfully renamed the temporary AOF base file %s into %s", tmpfile, new_base_filename);
         }
-        latencyEndMonitor(latency);
-        latencyAddSampleIfNeeded("aof-rename", latency);
-        serverLog(LL_NOTICE,
-            "Successfully renamed the temporary AOF base file %s into %s", tmpfile, new_base_filename);
 
         /* Rename the temporary incr aof file to 'new_incr_filename'. */
         if (server.aof_state == AOF_WAIT_REWRITE) {
@@ -3931,7 +4256,10 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
 
         /* Persist our modifications. */
         if (persistAofManifest(temp_am) == C_ERR) {
-            bg_unlink(new_base_filepath);
+            if (accelEnabled())
+                aofAccelClearRewriteBase(1);
+            else
+                bg_unlink(new_base_filepath);
             aofManifestFree(temp_am);
             sdsfree(new_base_filepath);
             if (new_incr_filepath) {
@@ -3947,6 +4275,12 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
 
         /* We can safely let `server.aof_manifest` point to 'temp_am' and free the previous one. */
         aofManifestFreeAndUpdate(temp_am);
+
+        /* Forget the installed log before aofRemoveTempFile() runs at cleanup. */
+        if (accelEnabled()) {
+            sdsfree(accel_rewrite_base_name);
+            accel_rewrite_base_name = NULL;
+        }
 
         if (server.aof_state != AOF_OFF) {
             /* AOF enabled. */
