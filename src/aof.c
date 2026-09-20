@@ -1290,6 +1290,61 @@ int aofFsyncInProgress(void) {
     return bioPendingJobsOfType(BIO_AOF_FSYNC) != 0;
 }
 
+/* Fold the outcome of the appends run on the bio AOF thread back into the
+ * main thread's AOF size accounting and write error status. */
+static void aofReapBioWrites(void) {
+    long long missing, done;
+
+    atomicGet(server.aof_bio_write_missing,missing);
+    if (missing != server.aof_bio_write_missing_seen) {
+        /* Drain first so the counters and the failed buffers are one snapshot. */
+        bioDrainWorker(BIO_AOF_WRITE);
+        atomicGet(server.aof_bio_write_missing,missing);
+    }
+    atomicGet(server.aof_bio_write_done,done);
+
+    if (missing != server.aof_bio_write_missing_seen) {
+        long long lost = missing - server.aof_bio_write_missing_seen;
+        int err;
+        sds failed;
+
+        atomicGet(server.aof_bio_write_errno,err);
+        server.aof_bio_write_missing_seen = missing;
+        /* Counted into the AOF size at hand-off; take back what never landed. */
+        server.aof_current_size -= lost;
+        server.aof_last_incr_size -= lost;
+        server.aof_last_write_errno = err;
+        server.aof_last_write_status = C_ERR;
+        serverLog(LL_WARNING,
+            "Error appending to the AOF store, %lld bytes did not land: %s",
+            lost, strerror(err));
+
+        failed = bioTakeFailedAofWrites();
+        if (failed) {
+            serverAssert(sdslen(failed) == (size_t)lost);
+            /* Back at the head of the buffer, retried in order by the next flush. */
+            sds rest = server.aof_buf;
+            server.aof_buf = sdscatsds(failed,rest);
+            sdsfree(rest);
+        }
+    } else if (server.aof_last_write_status == C_ERR &&
+               done != server.aof_bio_write_done_seen)
+    {
+        serverLog(LL_NOTICE,
+            "AOF write error looks solved, Redis can write again.");
+        server.aof_last_write_status = C_OK;
+    }
+    server.aof_bio_write_done_seen = done;
+}
+
+/* Wait for the appends handed to the bio AOF worker and reap their outcome.
+ * Needed before the main thread operates on the store itself. */
+void aofDrainBioWrites(void) {
+    if (!accelEnabled()) return;
+    bioDrainWorker(BIO_AOF_WRITE);
+    aofReapBioWrites();
+}
+
 /* Starts a background task that performs fsync() against the specified
  * file descriptor (the one of the AOF file) in another thread. */
 void aof_background_fsync(int fd) {
@@ -1475,6 +1530,21 @@ void flushAppendOnlyFile(int force) {
     ssize_t nwritten;
     int sync_in_progress = 0;
     mstime_t latency;
+    size_t buflen;
+    /* Under accelstore an append is a device round trip: run it on the bio AOF
+     * thread unless the reply waits for it (always) or the caller needs it inline. */
+    int write_in_bio = accelEnabled() && !force &&
+                       server.aof_fsync != AOF_FSYNC_ALWAYS;
+
+    if (accelEnabled()) {
+        aofReapBioWrites();
+        /* An inline append must not overtake queued ones; reap again so a
+         * failure during the drain lands back in aof_buf. */
+        if (!write_in_bio) {
+            bioDrainWorker(BIO_AOF_WRITE);
+            aofReapBioWrites();
+        }
+    }
 
     if (sdslen(server.aof_buf) == 0) {
         if (server.aof_last_incr_fsync_offset == server.aof_last_incr_size) {
@@ -1507,10 +1577,31 @@ void flushAppendOnlyFile(int force) {
         return;
     }
 
+    buflen = sdslen(server.aof_buf);
+
+    /* Hold a small buffer back and append it as one larger entry. */
+    if (write_in_bio && buflen < ACCEL_AOF_FLUSH_MIN_BYTES) {
+        /* Never hold back what the everysec barrier is due to cover. */
+        int fsync_due = server.aof_fsync == AOF_FSYNC_EVERYSEC &&
+                        server.mstime - server.aof_last_fsync >= 1000;
+
+        if (!fsync_due) {
+            if (server.aof_flush_accum_start == 0) {
+                server.aof_flush_accum_start = server.mstime;
+                return;
+            } else if (server.mstime - server.aof_flush_accum_start <
+                       ACCEL_AOF_FLUSH_MAX_DELAY_MS) {
+                return;
+            }
+        }
+    }
+    server.aof_flush_accum_start = 0;
+
     if (server.aof_fsync == AOF_FSYNC_EVERYSEC)
         sync_in_progress = aofFsyncInProgress();
 
-    if (server.aof_fsync == AOF_FSYNC_EVERYSEC && !force) {
+    /* A hand-off to the bio thread never blocks behind the background fsync. */
+    if (server.aof_fsync == AOF_FSYNC_EVERYSEC && !force && !write_in_bio) {
         /* With this append fsync policy we do background fsyncing.
          * If the fsync is still in progress we can try to delay
          * the write for a couple of seconds. */
@@ -1541,8 +1632,40 @@ void flushAppendOnlyFile(int force) {
         usleep(server.aof_flush_sleep);
     }
 
+    /* Bound the append queue: a store that cannot keep up slows the event loop
+     * down instead. Waits for one job's worth of room, not for a drain. */
+    if (write_in_bio &&
+        bioPendingJobsOfType(BIO_AOF_WRITE) >= ACCEL_AOF_WRITE_MAX_PENDING)
+    {
+        static time_t last_backpressure_log = 0;
+        mstime_t stall_start, stall;
+
+        if ((server.unixtime - last_backpressure_log) > AOF_WRITE_LOG_ERROR_RATE) {
+            last_backpressure_log = server.unixtime;
+            serverLog(LL_NOTICE,
+                "The AOF store is not keeping up with the write load, waiting "
+                "for room in the %d deep append queue, this may slow down "
+                "Redis.", ACCEL_AOF_WRITE_MAX_PENDING);
+        }
+        /* mstime() rather than latencyStartMonitor(): the stats must count
+         * even with the latency monitor off. */
+        stall_start = mstime();
+        bioWaitJobsOfTypeBelow(BIO_AOF_WRITE,ACCEL_AOF_WRITE_MAX_PENDING);
+        stall = mstime() - stall_start;
+        latencyAddSampleIfNeeded("aof-write-backpressure",stall);
+        server.stat_aof_bio_write_stalls++;
+        server.stat_aof_bio_write_stall_ms += stall;
+    }
+
     latencyStartMonitor(latency);
-    nwritten = aofWrite(server.aof_fd,server.aof_buf,sdslen(server.aof_buf));
+    if (write_in_bio) {
+        /* The job owns the buffer and frees it once the append has run. */
+        bioCreateAofWriteJob(server.aof_fd,server.aof_buf,buflen);
+        server.aof_buf = sdsempty();
+        nwritten = (ssize_t)buflen;
+    } else {
+        nwritten = aofWrite(server.aof_fd,server.aof_buf,buflen);
+    }
     latencyEndMonitor(latency);
     /* We want to capture different events for delayed writes:
      * when the delay happens with a pending fsync, or with a saving child
@@ -1561,7 +1684,7 @@ void flushAppendOnlyFile(int force) {
     /* We performed the write so reset the postponed flush sentinel to zero. */
     server.aof_flush_postponed_start = 0;
 
-    if (nwritten != (ssize_t)sdslen(server.aof_buf)) {
+    if (nwritten != (ssize_t)buflen) {
         static time_t last_write_error_log = 0;
         int can_log = 0;
 
@@ -1584,7 +1707,7 @@ void flushAppendOnlyFile(int force) {
                                        "the AOF file: (nwritten=%lld, "
                                        "expected=%lld)",
                                        (long long)nwritten,
-                                       (long long)sdslen(server.aof_buf));
+                                       (long long)buflen);
             }
 
             if (accelEnabled()) {
@@ -1630,8 +1753,9 @@ void flushAppendOnlyFile(int force) {
         }
     } else {
         /* Successful write(2). If AOF was in error state, restore the
-         * OK state and log the event. */
-        if (server.aof_last_write_status == C_ERR) {
+         * OK state and log the event. A hand-off is not a successful write:
+         * only a completed append (seen by the reap) may clear the error. */
+        if (!write_in_bio && server.aof_last_write_status == C_ERR) {
             serverLog(LL_NOTICE,
                 "AOF write error looks solved, Redis can write again.");
             server.aof_last_write_status = C_OK;
@@ -3973,7 +4097,8 @@ static void backupSealCommand(client *c) {
     /* Flush and fsync the current INCR before pinning it. In the appendonly-yes
      * path the later rotation is what stops this INCR from receiving writes. */
     flushAppendOnlyFile(1);
-    if (redis_fsync(server.aof_fd) == -1) {
+    /* Under accelstore aof_fd is a store descriptor; the barrier is the fsync. */
+    if ((accelEnabled() ? accelFsync() : redis_fsync(server.aof_fd)) == -1) {
         char err[256];
         snprintf(err, sizeof(err), "failed to fsync incr file: %s", strerror(errno));
         backupSetFailed(err);

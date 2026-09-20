@@ -75,6 +75,15 @@ int accelInit(void) {
               server.accel_device, pyas_workers(accel_store),
               server.accel_tc_rtt_us > 0 ? "mock-remote" : "local",
               server.accel_tc_rtt_us > 0 ? " rtt" : "");
+    serverLog(LL_NOTICE,
+              "accelstore: AOF appends run on the bio AOF thread unless "
+              "appendfsync is always or the flush is forced "
+              "(ACCEL_AOF_FLUSH_MIN_BYTES=%d KiB, "
+              "ACCEL_AOF_FLUSH_MAX_DELAY_MS=%d, "
+              "ACCEL_AOF_WRITE_MAX_PENDING=%d)",
+              ACCEL_AOF_FLUSH_MIN_BYTES / 1024,
+              ACCEL_AOF_FLUSH_MAX_DELAY_MS,
+              ACCEL_AOF_WRITE_MAX_PENDING);
 
     /* Move the main thread off the spinning SPDK reactor cores. */
     if (have_mask) {
