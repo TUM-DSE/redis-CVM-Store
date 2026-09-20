@@ -32,6 +32,9 @@
 #define ACCEL_AOF_FLUSH_MIN_BYTES (256 * 1024)
 #define ACCEL_AOF_FLUSH_MAX_DELAY_MS 100
 
+/* Rewrite pipe buffer; the 64 KiB default stalls the writer on every segment. */
+#define ACCEL_PIPE_BYTES (1 << 20)
+
 #ifdef USE_ACCELSTORE
 
 int accelEnabled(void);
@@ -52,6 +55,9 @@ long long accelLogTotalBytes(const char *name);    /* sum of entry sizes; -1 on 
  * (fopencookie). Supports rewind to 0 and ftello; *total_bytes (may be NULL)
  * receives the log's total payload size. */
 FILE *accelOpenReadStream(const char *name, long long *total_bytes);
+
+void accelSetPipeSize(int fd);        /* widen to ACCEL_PIPE_BYTES; best effort */
+void accelDeprioritiseChild(void);    /* saving child, after redisSetCpuAffinity() */
 
 /* Pipe drainer: reads pipe_rd until EOF, appending ACCEL_SEGMENT_BYTES
  * entries to asfd. One drainer at a time (Redis runs one saving child at a
@@ -80,6 +86,8 @@ static inline long long accelLogTotalBytes(const char *name) { (void)name; retur
 static inline FILE *accelOpenReadStream(const char *name, long long *total_bytes) {
     (void)name; (void)total_bytes; return NULL;
 }
+static inline void accelSetPipeSize(int fd) { (void)fd; }
+static inline void accelDeprioritiseChild(void) {}
 static inline int accelStartDrainer(int pipe_rd, int asfd) { (void)pipe_rd; (void)asfd; return -1; }
 static inline int accelJoinDrainer(long long *bytes_out) { (void)bytes_out; return -1; }
 static inline const char *accelStrerror(int rc) { (void)rc; return "accelstore support not compiled in"; }

@@ -3484,7 +3484,7 @@ static int rewriteAppendOnlyFileToAccelLog(const char *base_name) {
         accelLogDelete(base_name);
         return C_ERR;
     }
-    fcntl(pipefd[0], F_SETPIPE_SZ, 1<<20); /* Best effort. */
+    accelSetPipeSize(pipefd[0]);
     if (accelStartDrainer(pipefd[0], asfd) == -1) {
         serverLog(LL_WARNING, "Can't start the AOF store drainer thread");
         close(pipefd[0]);
@@ -3607,7 +3607,7 @@ int rewriteAppendOnlyFileBackground(void) {
             server.aof_lastbgrewrite_status = C_ERR;
             return C_ERR;
         }
-        fcntl(accel_pipe[0], F_SETPIPE_SZ, 1<<20); /* Best effort. */
+        accelSetPipeSize(accel_pipe[0]);
     }
 
     if ((childpid = redisFork(CHILD_TYPE_AOF)) == 0) {
@@ -3618,6 +3618,8 @@ int rewriteAppendOnlyFileBackground(void) {
         redisSetCpuAffinity(server.aof_rewrite_cpulist);
         if (accelEnabled()) {
             rio aof;
+
+            accelDeprioritiseChild();
 
             close(accel_pipe[0]);
             rioInitWithFd(&aof, accel_pipe[1]);

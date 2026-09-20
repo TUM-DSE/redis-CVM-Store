@@ -10,10 +10,148 @@
 #include <errno.h>
 #include <string.h>
 #include <stdlib.h>
+#include <fcntl.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 
+#include "bio.h"
 #include "pyas_shim.h"
 
 static struct pyas_store *accel_store = NULL;
+
+/* Set when the rewrite child and the drainer share the event loop's cpus. */
+static int accel_rewrite_shared = 0;
+#define ACCEL_REWRITE_NICE 10
+
+/* Render a cpu set as a taskset-style list ("0-3,7"). */
+static void accelFormatCpuList(const cpu_set_t *set, char *out, size_t outlen) {
+    size_t used = 0;
+    int cpu = 0;
+
+    out[0] = '\0';
+    while (cpu < CPU_SETSIZE) {
+        int first, last;
+
+        if (!CPU_ISSET(cpu, set)) { cpu++; continue; }
+        first = cpu;
+        while (cpu + 1 < CPU_SETSIZE && CPU_ISSET(cpu + 1, set)) cpu++;
+        last = cpu++;
+
+        int n = first == last ?
+            snprintf(out + used, outlen - used, "%s%d", used ? "," : "", first) :
+            snprintf(out + used, outlen - used, "%s%d-%d", used ? "," : "", first, last);
+        if (n < 0 || (size_t)n >= outlen - used) break;
+        used += (size_t)n;
+    }
+}
+
+/* Lower the calling thread's priority (per thread on Linux, no capability). */
+static void accelNiceSelf(const char *what) {
+    errno = 0;
+    if (setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), ACCEL_REWRITE_NICE) == -1)
+        serverLog(LL_VERBOSE, "accelstore: can't nice %s: %s", what, strerror(errno));
+    else
+        serverLog(LL_VERBOSE, "accelstore: %s runs at nice +%d", what,
+                  ACCEL_REWRITE_NICE);
+}
+
+/* Move the main thread and the bio workers off the reactor cpus and decide
+ * where the AOF rewrite child and its drainer go. Called once from accelInit(). */
+static void accelPlaceThreadsOffReactorCores(void) {
+    unsigned long long mask = strtoull(server.accel_core_mask, NULL, 0);
+    char cpulist[512], rewritelist[512];
+    cpu_set_t cur, trimmed, rewrite;
+    const char *source, *rewrite_unit = "cpus";
+    int bio_failed;
+
+    if (mask == 0) return;
+    if (pthread_getaffinity_np(pthread_self(), sizeof(cur), &cur) != 0) return;
+
+    trimmed = cur;
+    for (int cpu = 0; cpu < 64; cpu++)
+        if (mask & (1ULL << cpu)) CPU_CLR(cpu, &trimmed);
+    if (CPU_COUNT(&trimmed) == 0) {
+        serverLog(LL_WARNING,
+                  "accelstore: reactor core mask %s covers every cpu this "
+                  "process may run on, leaving the event loop on the reactor "
+                  "cores", server.accel_core_mask);
+        return;
+    }
+
+    /* An explicit aof-rewrite-cpulist is taken as given. */
+    if (server.aof_rewrite_cpulist && server.aof_rewrite_cpulist[0] != '\0') {
+        redis_strlcpy(rewritelist, server.aof_rewrite_cpulist, sizeof(rewritelist));
+        source = "aof-rewrite-cpulist";
+    } else if (CPU_COUNT(&trimmed) >= 3) {
+        int top = -1;
+
+        for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
+            if (CPU_ISSET(cpu, &trimmed)) top = cpu;
+        CPU_ZERO(&rewrite);
+        CPU_SET(top, &rewrite);
+        CPU_CLR(top, &trimmed);
+        accelFormatCpuList(&rewrite, rewritelist, sizeof(rewritelist));
+        source = "derived";
+        rewrite_unit = "cpu";
+    } else {
+        /* Two cpus or fewer: share with the event loop, niced. */
+        accelFormatCpuList(&trimmed, rewritelist, sizeof(rewritelist));
+        accel_rewrite_shared = 1;
+        source = "shared, deprioritised";
+    }
+    if (server.aof_rewrite_cpulist == NULL)
+        server.aof_rewrite_cpulist = zstrdup(rewritelist);
+    if (server.bgsave_cpulist == NULL)
+        server.bgsave_cpulist = zstrdup(rewritelist);
+
+    accelFormatCpuList(&trimmed, cpulist, sizeof(cpulist));
+
+    int rc = pthread_setaffinity_np(pthread_self(), sizeof(trimmed), &trimmed);
+    if (rc != 0) {
+        serverLog(LL_WARNING, "accelstore: can't move the main thread off the "
+                              "reactor cores: %s", strerror(rc));
+        return;
+    }
+
+    /* The bio workers already exist (InitServerLast), so re-apply their
+     * affinity; an explicit bio-cpulist is left alone. */
+    if (server.bio_cpulist == NULL) {
+        bio_failed = bioSetWorkerAffinity(&trimmed, sizeof(trimmed));
+        if (bio_failed)
+            serverLog(LL_WARNING, "accelstore: %d bio worker(s) could not be "
+                                  "moved off the reactor cores", bio_failed);
+        server.bio_cpulist = zstrdup(cpulist);
+    }
+
+    serverLog(LL_NOTICE,
+              "accelstore: reactor cores %s reserved; main thread and bio "
+              "workers on cpus %s%s; AOF rewrite child and drainer on %s %s (%s)",
+              server.accel_core_mask, cpulist,
+              server.bio_cpulist && strcmp(server.bio_cpulist, cpulist) ?
+                  " (bio workers on the configured bio-cpulist)" : "",
+              rewrite_unit, rewritelist, source);
+}
+
+/* Called by a saving child after redisSetCpuAffinity(). */
+void accelDeprioritiseChild(void) {
+    if (!accel_rewrite_shared) return;
+    accelNiceSelf("the saving child");
+}
+
+/* Widen a rewrite pipe; best effort (F_SETPIPE_SZ is capped by pipe-max-size). */
+void accelSetPipeSize(int fd) {
+    int got = fcntl(fd, F_SETPIPE_SZ, ACCEL_PIPE_BYTES);
+
+    if (got == -1) {
+        int err = errno;
+        got = fcntl(fd, F_GETPIPE_SZ);
+        serverLog(LL_VERBOSE, "accelstore: rewrite pipe stays at %d bytes "
+                              "(F_SETPIPE_SZ %d: %s)", got, ACCEL_PIPE_BYTES,
+                              strerror(err));
+    } else {
+        serverLog(LL_VERBOSE, "accelstore: rewrite pipe buffer is %d bytes", got);
+    }
+}
 
 int accelEnabled(void) {
     return server.accel_config != NULL && server.accel_config[0] != '\0';
@@ -89,25 +227,8 @@ int accelInit(void) {
               ACCEL_AOF_FLUSH_MAX_DELAY_MS,
               ACCEL_AOF_WRITE_MAX_PENDING);
 
-    /* With an explicit reactor core mask, move this (the main) thread off the
-     * reactor cores: SPDK reactors spin at 100% and the event loop must not
-     * share a core with them. Bio threads and io-threads are left to the
-     * scheduler, which keeps them off the busy cores in practice. */
-    if (have_mask) {
-        unsigned long long mask = strtoull(server.accel_core_mask, NULL, 0);
-        cpu_set_t cur;
-        if (mask != 0 && pthread_getaffinity_np(pthread_self(), sizeof(cur), &cur) == 0) {
-            cpu_set_t trimmed = cur;
-            for (int cpu = 0; cpu < 64; cpu++)
-                if (mask & (1ULL << cpu)) CPU_CLR(cpu, &trimmed);
-            if (CPU_COUNT(&trimmed) > 0 &&
-                pthread_setaffinity_np(pthread_self(), sizeof(trimmed), &trimmed) == 0) {
-                serverLog(LL_NOTICE,
-                          "accelstore: main thread moved off reactor cores (mask %s), "
-                          "%d cpus remain", server.accel_core_mask, CPU_COUNT(&trimmed));
-            }
-        }
-    }
+    /* SPDK reactors spin at 100%; keep our threads off their cores. */
+    if (have_mask) accelPlaceThreadsOffReactorCores();
     return C_OK;
 }
 
@@ -368,7 +489,13 @@ static accelDrainer drainer = {.active = 0};
 
 static void *accelDrainerMain(void *arg) {
     accelDrainer *d = arg;
-    char *seg = zmalloc(ACCEL_SEGMENT_BYTES);
+    char *seg;
+
+    /* The drainer is the rewrite child's peer: same cpus, niced when shared. */
+    redisSetCpuAffinity(server.aof_rewrite_cpulist);
+    if (accel_rewrite_shared) accelNiceSelf("the AOF rewrite drainer");
+
+    seg = zmalloc(ACCEL_SEGMENT_BYTES);
     size_t fill = 0;
     for (;;) {
         ssize_t n = read(d->pipe_rd, seg + fill, ACCEL_SEGMENT_BYTES - fill);

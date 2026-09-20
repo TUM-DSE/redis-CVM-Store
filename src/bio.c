@@ -194,6 +194,24 @@ void bioInit(void) {
     }
 }
 
+/* Re-apply a cpu affinity to the running workers. cpuset is a cpu_set_t, taken
+ * as void * to keep <sched.h> out of bio.h. Returns how many could not be moved. */
+int bioSetWorkerAffinity(const void *cpuset, size_t setsize) {
+    int failed = 0;
+#ifdef __linux__
+    for (unsigned long j = 0; j < BIO_WORKER_NUM; j++) {
+        if (bio_threads[j] == 0) { failed++; continue; }
+        if (pthread_setaffinity_np(bio_threads[j], setsize, cpuset) != 0)
+            failed++;
+    }
+#else
+    UNUSED(cpuset);
+    UNUSED(setsize);
+    failed = BIO_WORKER_NUM;
+#endif
+    return failed;
+}
+
 int bioIsLazyfreeWorker(void) {
     return pthread_equal(pthread_self(), bio_threads[BIO_WORKER_LAZY_FREE]);
 }
