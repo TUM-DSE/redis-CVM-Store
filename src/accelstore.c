@@ -209,10 +209,12 @@ int accelInit(void) {
         return C_ERR;
     }
     serverLog(LL_NOTICE,
-              "accelstore: store up (device %s, workers %u, tc %s%s)",
+              "accelstore: store up (device %s, workers %u, tc %s%s, "
+              "fork-child reactor nap %d us)",
               server.accel_device, pyas_workers(accel_store),
               server.accel_tc_rtt_us > 0 ? "mock-remote" : "local",
-              server.accel_tc_rtt_us > 0 ? " rtt" : "");
+              server.accel_tc_rtt_us > 0 ? " rtt" : "",
+              server.accel_nap_us);
     serverLog(LL_NOTICE,
               "accelstore: AOF appends run on the bio AOF thread unless "
               "appendfsync is always or the flush is forced "
@@ -322,6 +324,29 @@ int accelFsync(void) {
         return -1;
     }
     return 0;
+}
+
+/* Idle reactors sleep in the kernel while a fork child lives, so the
+ * parent's copy-on-write faults do not IPI their cpus. */
+void accelSetNap(int on) {
+    static int nap_on = 0;
+
+    if (accel_store == NULL || server.accel_nap_us <= 0) return;
+    if (on == nap_on) return;
+
+    int rc = pyas_set_nap(accel_store, on ? (uint32_t)server.accel_nap_us : 0u);
+    if (rc != 0) {
+        /* State unchanged: a later call for the same value retries. */
+        serverLog(LL_WARNING, "accelstore: could not %s reactor naps: %s",
+                  on ? "enable" : "disable", pyas_error_string(rc));
+        return;
+    }
+    nap_on = on;
+    if (on)
+        serverLog(LL_NOTICE, "accelstore: reactor naps on (%d us) while the fork "
+                             "child runs", server.accel_nap_us);
+    else
+        serverLog(LL_NOTICE, "accelstore: reactor naps off");
 }
 
 long long accelLogTotalBytes(const char *name) {
