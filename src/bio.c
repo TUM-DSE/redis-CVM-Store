@@ -60,6 +60,7 @@ static char* bio_worker_title[] = {
 static unsigned int bio_job_to_worker[] = {
     [BIO_CLOSE_FILE] = 0,
     [BIO_AOF_FSYNC] = 1,
+    [BIO_AOF_WRITE] = 1, /* Same worker: FIFO keeps appends ordered against fsync/close. */
     [BIO_CLOSE_AOF] = 1,
     [BIO_LAZY_FREE] = 2,
     [BIO_COMP_RQ_CLOSE_FILE] = 0,
@@ -72,6 +73,11 @@ static pthread_mutex_t bio_mutex[BIO_WORKER_NUM];
 static pthread_cond_t bio_newjob_cond[BIO_WORKER_NUM];
 static list *bio_jobs[BIO_WORKER_NUM];
 static unsigned long bio_jobs_counter[BIO_NUM_OPS] = {0};
+
+/* Buffers of failed AOF appends, in submission order. Non-NULL also means
+ * "stop appending" until the main thread takes them back. */
+static sds bio_aof_failed_writes = NULL;
+static pthread_mutex_t bio_aof_failed_mutex;
 
 /* The bio_comp_list is used to hold completion job responses and to handover
  * to main thread to callback as notification for job completion. Main
@@ -103,6 +109,14 @@ typedef union bio_job {
         unsigned need_reclaim_cache:1; /* A flag to indicate that reclaim cache is required before
                                 * the file is closed. */
     } fd_args;
+
+    /* AOF append (accelstore backend). The job owns buf and frees it. */
+    struct {
+        int type;
+        int fd;
+        char *buf;
+        size_t len;
+    } write_args;
 
     struct {
         int type;
@@ -141,6 +155,7 @@ void bioInit(void) {
     /* init jobs comp responses */
     bio_comp_list = listCreate();
     pthread_mutex_init(&bio_mutex_comp, NULL);
+    pthread_mutex_init(&bio_aof_failed_mutex, NULL);
 
     /* Create a pipe for background thread to be able to wake up the redis main thread.
      * Make the pipe non blocking. This is just a best effort aware mechanism
@@ -250,6 +265,17 @@ void bioCreateCloseAofJob(int fd, long long offset, int need_reclaim_cache) {
     bioSubmitJob(BIO_CLOSE_AOF, job);
 }
 
+/* Append buf (an sds, ownership taken) to the AOF in a bio job. */
+void bioCreateAofWriteJob(int fd, char *buf, size_t len) {
+    bio_job *job = zmalloc(sizeof(*job));
+    job->write_args.fd = fd;
+    job->write_args.buf = buf;
+    job->write_args.len = len;
+
+    atomicIncr(server.aof_bio_write_queued_bytes,(long long)len);
+    bioSubmitJob(BIO_AOF_WRITE, job);
+}
+
 void bioCreateFsyncJob(int fd, long long offset, int need_reclaim_cache) {
     bio_job *job = zmalloc(sizeof(*job));
     job->fd_args.fd = fd;
@@ -314,6 +340,41 @@ void *bioProcessBackgroundJobs(void *arg) {
                 }
             }
             close(job->fd_args.fd);
+        } else if (job_type == BIO_AOF_WRITE) {
+            size_t len = job->write_args.len, landed = 0;
+            int stopped;
+
+            pthread_mutex_lock(&bio_aof_failed_mutex);
+            stopped = bio_aof_failed_writes != NULL;
+            pthread_mutex_unlock(&bio_aof_failed_mutex);
+
+            if (!stopped) {
+                ssize_t nwritten = accelLogAppend(job->write_args.fd,
+                                                  job->write_args.buf, len);
+                if (nwritten == (ssize_t)len) {
+                    atomicIncr(server.aof_bio_write_done,1);
+                    landed = len;
+                } else {
+                    atomicSet(server.aof_bio_write_errno,
+                              nwritten == -1 ? errno : ENOSPC);
+                    if (nwritten > 0) landed = (size_t)nwritten;
+                }
+            }
+
+            if (landed != len) {
+                /* Hand the rest back for the main thread to retry in order. */
+                pthread_mutex_lock(&bio_aof_failed_mutex);
+                if (bio_aof_failed_writes == NULL)
+                    bio_aof_failed_writes = sdsempty();
+                bio_aof_failed_writes = sdscatlen(bio_aof_failed_writes,
+                                                  job->write_args.buf + landed,
+                                                  len - landed);
+                pthread_mutex_unlock(&bio_aof_failed_mutex);
+                atomicIncr(server.aof_bio_write_missing,
+                           (long long)(len - landed));
+            }
+            atomicDecr(server.aof_bio_write_queued_bytes,(long long)len);
+            sdsfree(job->write_args.buf);
         } else if (job_type == BIO_AOF_FSYNC || job_type == BIO_CLOSE_AOF) {
             /* Under the AccelStore backend the AOF "fd" is a store descriptor:
              * the fsync is the store's global durability barrier and the close
@@ -401,6 +462,28 @@ unsigned long bioPendingJobsOfType(int type) {
     pthread_mutex_unlock(&bio_mutex[worker]);
 
     return val;
+}
+
+/* Take back the failed AOF appends (caller owns the sds), or NULL. Call only
+ * with the AOF worker drained: taking them lets appends resume. */
+char *bioTakeFailedAofWrites(void) {
+    sds failed;
+
+    pthread_mutex_lock(&bio_aof_failed_mutex);
+    failed = bio_aof_failed_writes;
+    bio_aof_failed_writes = NULL;
+    pthread_mutex_unlock(&bio_aof_failed_mutex);
+    return failed;
+}
+
+/* Wait until fewer than 'limit' jobs of the specified type are pending. */
+void bioWaitJobsOfTypeBelow(int job_type, unsigned long limit) {
+    unsigned long worker = bio_job_to_worker[job_type];
+
+    pthread_mutex_lock(&bio_mutex[worker]);
+    while (bio_jobs_counter[job_type] >= limit)
+        pthread_cond_wait(&bio_newjob_cond[worker], &bio_mutex[worker]);
+    pthread_mutex_unlock(&bio_mutex[worker]);
 }
 
 /* Wait for the job queue of the worker for jobs of specified type to become empty. */

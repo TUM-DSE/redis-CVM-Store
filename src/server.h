@@ -2368,6 +2368,7 @@ struct redisServer {
     int aof_fd;       /* File descriptor of currently selected AOF file */
     int aof_selected_db; /* Currently selected DB in AOF */
     mstime_t aof_flush_postponed_start; /* mstime of postponed AOF flush */
+    mstime_t aof_flush_accum_start; /* mstime aof_buf started being held back (accelstore) */
     mstime_t aof_last_fsync;            /* mstime of last fsync() */
     time_t aof_rewrite_time_last;   /* Time used by last AOF rewrite run. */
     time_t aof_rewrite_time_start;  /* Current AOF rewrite start time. */
@@ -2384,6 +2385,14 @@ struct redisServer {
     int aof_use_rdb_preamble;       /* Specify base AOF to use RDB encoding on AOF rewrites. */
     redisAtomic int aof_bio_fsync_status; /* Status of AOF fsync in bio job. */
     redisAtomic int aof_bio_fsync_errno;  /* Errno of AOF fsync in bio job. */
+    redisAtomic int aof_bio_write_errno;  /* Errno of the last failed bio append. */
+    redisAtomic long long aof_bio_write_missing; /* Bytes handed to bio that never landed. */
+    redisAtomic long long aof_bio_write_done; /* Bio appends that completed. */
+    long long aof_bio_write_missing_seen; /* Main thread's mirror of the above at last reap. */
+    long long aof_bio_write_done_seen;
+    redisAtomic long long aof_bio_write_queued_bytes; /* Bytes handed to bio, not appended yet. */
+    long long stat_aof_bio_write_stalls;  /* Flushes that waited for room in the append queue. */
+    long long stat_aof_bio_write_stall_ms; /* Total time spent in that wait. */
     aofManifest *aof_manifest;       /* Used to track AOFs. */
     int aof_disable_auto_gc;         /* If disable automatically deleting HISTORY type AOFs?
                                         default no. (for testings). */
@@ -3669,6 +3678,7 @@ int bg_unlink(const char *filename);
 
 /* AOF persistence */
 void flushAppendOnlyFile(int force);
+void aofDrainBioWrites(void);
 void feedAppendOnlyFile(int dictid, robj **argv, int argc);
 void aofRemoveTempFile(pid_t childpid);
 int rewriteAppendOnlyFileBackground(void);

@@ -2751,6 +2751,8 @@ int updateRequirePass(const char **err) {
 
 int updateAppendFsync(const char **err) {
     UNUSED(err);
+    /* Queued appends must land before the new policy appends inline. */
+    aofDrainBioWrites();
     if (server.aof_fsync == AOF_FSYNC_ALWAYS) {
         /* Wait for all bio jobs related to AOF to drain before proceeding. This prevents a race
          * between updates to `fsynced_reploff_pending` done in the main thread and those done on the

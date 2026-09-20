@@ -25,6 +25,13 @@
  * drainer. 4 MiB matches REDIS_AUTOSYNC_BYTES, the rio autosync window. */
 #define ACCEL_SEGMENT_BYTES (4 << 20)
 
+/* AOF appends queued on the bio AOF thread before the event loop waits for room. */
+#define ACCEL_AOF_WRITE_MAX_PENDING 32
+
+/* Accumulate aof_buf up to this size before appending it, holding it no longer than this. */
+#define ACCEL_AOF_FLUSH_MIN_BYTES (256 * 1024)
+#define ACCEL_AOF_FLUSH_MAX_DELAY_MS 100
+
 #ifdef USE_ACCELSTORE
 
 int accelEnabled(void);

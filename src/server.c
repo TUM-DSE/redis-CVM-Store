@@ -2460,6 +2460,13 @@ void initServerConfig(void) {
     server.aof_last_fsync = time(NULL) * 1000;
     server.aof_cur_timestamp = 0;
     atomicSet(server.aof_bio_fsync_status,C_OK);
+    atomicSet(server.aof_bio_write_missing,0);
+    atomicSet(server.aof_bio_write_done,0);
+    server.aof_bio_write_missing_seen = 0;
+    server.aof_bio_write_done_seen = 0;
+    atomicSet(server.aof_bio_write_queued_bytes,0);
+    server.stat_aof_bio_write_stalls = 0;
+    server.stat_aof_bio_write_stall_ms = 0;
     server.aof_rewrite_time_last = -1;
     server.aof_rewrite_time_start = -1;
     server.aof_lastbgrewrite_status = C_OK;
@@ -2467,6 +2474,7 @@ void initServerConfig(void) {
     server.aof_fd = -1;
     server.aof_selected_db = -1; /* Make sure the first time will not match */
     server.aof_flush_postponed_start = 0;
+    server.aof_flush_accum_start = 0;
     server.aof_last_incr_size = 0;
     server.aof_last_incr_fsync_offset = 0;
     server.active_defrag_running = 0;
@@ -2981,6 +2989,8 @@ void resetServerStats(void) {
     server.stat_total_error_replies = 0;
     server.stat_dump_payload_sanitizations = 0;
     server.aof_delayed_fsync = 0;
+    server.stat_aof_bio_write_stalls = 0;
+    server.stat_aof_bio_write_stall_ms = 0;
     server.stat_reply_buffer_shrinks = 0;
     server.stat_reply_buffer_expands = 0;
     server.stat_cluster_incompatible_ops = 0;
@@ -5208,7 +5218,9 @@ int finishShutdown(void) {
         flushAppendOnlyFile(1);
         if (accelEnabled()) {
             if (accelFsync() == -1)
-                serverLog(LL_WARNING,"Fail to fsync the AOF store: %s.", strerror(errno));
+                serverLog(LL_WARNING,"Fail to fsync the AOF store: %s. "
+                          "Everything appended since the last barrier is lost.",
+                          strerror(errno));
         } else if (redis_fsync(server.aof_fd) == -1) {
             serverLog(LL_WARNING,"Fail to fsync the AOF file: %s.",
                                  strerror(errno));
@@ -5274,7 +5286,9 @@ int finishShutdown(void) {
     /* Stop the AccelStore store last: drain the bio AOF worker first so no
      * store operation is outstanding when the store shuts down. */
     if (accelEnabled()) {
+        bioDrainWorker(BIO_AOF_WRITE);
         bioDrainWorker(BIO_AOF_FSYNC);
+        serverLog(LL_NOTICE,"Stopping the AccelStore store.");
         accelShutdown();
     }
 
@@ -6698,13 +6712,19 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             "module_fork_last_cow_size:%zu\r\n", server.stat_module_cow_bytes));
 
         if (server.aof_enabled) {
+            long long aof_bio_queued_bytes;
+            atomicGet(server.aof_bio_write_queued_bytes,aof_bio_queued_bytes);
             info = sdscatprintf(info, FMTARGS(
                 "aof_current_size:%lld\r\n", (long long) server.aof_current_size,
                 "aof_base_size:%lld\r\n", (long long) server.aof_rewrite_base_size,
                 "aof_pending_rewrite:%d\r\n", server.aof_rewrite_scheduled,
                 "aof_buffer_length:%zu\r\n", sdslen(server.aof_buf),
                 "aof_pending_bio_fsync:%lu\r\n", bioPendingJobsOfType(BIO_AOF_FSYNC),
-                "aof_delayed_fsync:%lu\r\n", server.aof_delayed_fsync));
+                "aof_delayed_fsync:%lu\r\n", server.aof_delayed_fsync,
+                "aof_pending_bio_write:%lu\r\n", bioPendingJobsOfType(BIO_AOF_WRITE),
+                "aof_bio_queued_bytes:%lld\r\n", aof_bio_queued_bytes,
+                "aof_bio_write_stalls:%lld\r\n", server.stat_aof_bio_write_stalls,
+                "aof_bio_write_stall_ms:%lld\r\n", server.stat_aof_bio_write_stall_ms));
         }
 
         if (server.loading) {
