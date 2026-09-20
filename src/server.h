@@ -2347,6 +2347,7 @@ struct redisServer {
     int accel_tc_rtt_us;            /* >0: mock-remote trusted counter RTT */
     unsigned long long accel_cluster_size; /* blobstore cluster size at creation */
     int accel_md_pages;             /* blobstore md pages at creation */
+    int accel_nap_us;               /* reactor nap (us) while a fork child lives, 0 = never */
 
     /* AOF persistence */
     int aof_enabled;                /* AOF configuration */

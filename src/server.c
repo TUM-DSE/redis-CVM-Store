@@ -851,6 +851,7 @@ int hasActiveChildProcess(void) {
 }
 
 void resetChildState(void) {
+    accelSetNap(0); /* Every child type's death passes through here. */
     server.child_type = CHILD_TYPE_NONE;
     server.child_pid = -1;
     server.stat_current_cow_peak = 0;
@@ -7619,6 +7620,7 @@ int redisFork(int purpose) {
         if (isMutuallyExclusiveChildType(purpose)) {
             server.child_pid = childpid;
             server.child_type = purpose;
+            accelSetNap(1); /* CoW faults IPI spinning reactors; off in resetChildState(). */
             server.stat_current_cow_peak = 0;
             server.stat_current_cow_bytes = 0;
             server.stat_current_cow_updated = 0;

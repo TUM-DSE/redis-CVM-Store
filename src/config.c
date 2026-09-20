@@ -3364,6 +3364,7 @@ standardConfig static_configs[] = {
     createIntConfig("accelstore-tc-rtt-us", NULL, IMMUTABLE_CONFIG, 0, INT_MAX, server.accel_tc_rtt_us, 0, INTEGER_CONFIG, NULL, NULL),
     createULongLongConfig("accelstore-cluster-size", NULL, IMMUTABLE_CONFIG, 0, ULLONG_MAX, server.accel_cluster_size, 16384, MEMORY_CONFIG, NULL, NULL),
     createIntConfig("accelstore-md-pages", NULL, IMMUTABLE_CONFIG, 0, INT_MAX, server.accel_md_pages, 65536, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("accelstore-nap-us", NULL, IMMUTABLE_CONFIG, 0, 100000, server.accel_nap_us, 50, INTEGER_CONFIG, NULL, NULL),
     createStringConfig("preload-file", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.preload_file, NULL, isValidPreloadFile, NULL),
     createStringConfig("server-cpulist", "server_cpulist", IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.server_cpulist, NULL, NULL, NULL),
     createStringConfig("bio-cpulist", "bio_cpulist", IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.bio_cpulist, NULL, NULL, NULL),

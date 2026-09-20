@@ -49,6 +49,7 @@ int accelLogDelete(const char *name);
 int accelLogExists(const char *name);              /* 1/0 */
 ssize_t accelLogAppend(int asfd, const void *buf, size_t len); /* splits > segment */
 int accelFsync(void);                              /* global durability barrier */
+void accelSetNap(int on);                          /* reactor naps while a fork child lives */
 long long accelLogTotalBytes(const char *name);    /* sum of entry sizes; -1 on error */
 
 /* Sequential oldest-to-newest read of a whole log as a stdio stream
@@ -82,6 +83,7 @@ static inline ssize_t accelLogAppend(int asfd, const void *buf, size_t len) {
     (void)asfd; (void)buf; (void)len; return -1;
 }
 static inline int accelFsync(void) { return -1; }
+static inline void accelSetNap(int on) { (void)on; }
 static inline long long accelLogTotalBytes(const char *name) { (void)name; return -1; }
 static inline FILE *accelOpenReadStream(const char *name, long long *total_bytes) {
     (void)name; (void)total_bytes; return NULL;
