@@ -35,6 +35,7 @@ typedef enum bio_job_type_t {
 
 /* Exported API */
 void bioInit(void);
+int bioSetWorkerAffinity(const void *cpuset, size_t setsize);
 unsigned long bioPendingJobsOfType(int type);
 void bioDrainWorker(int job_type);
 void bioWaitJobsOfTypeBelow(int job_type, unsigned long limit);

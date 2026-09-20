@@ -2347,7 +2347,7 @@ int rdbSave(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
         if ((asfd = accelLogCreate(name)) < 0) { err_op = "accelLogCreate"; goto aerr; }
         created = 1;
         if (pipe(pipefds) == -1) { err_op = "pipe"; goto aerr; }
-        fcntl(pipefds[1],F_SETPIPE_SZ,1<<20); /* Best effort. */
+        accelSetPipeSize(pipefds[1]);
         if (accelStartDrainer(pipefds[0],asfd) != 0) { err_op = "accelStartDrainer"; goto aerr; }
         pipefds[0] = -1; /* Now owned by the drainer. */
         drainer = 1;
@@ -2460,7 +2460,7 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
             server.lastbgsave_status = C_ERR;
             return C_ERR;
         }
-        fcntl(accel_pipe[1],F_SETPIPE_SZ,1<<20); /* Best effort. */
+        accelSetPipeSize(accel_pipe[1]);
     }
 
     if ((childpid = redisFork(CHILD_TYPE_RDB)) == 0) {
@@ -2471,6 +2471,8 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
         redisSetCpuAffinity(server.bgsave_cpulist);
         if (accelEnabled()) {
             char *err_op;
+
+            accelDeprioritiseChild();
 
             close(accel_pipe[0]);
             startSaving(rdbflags);
